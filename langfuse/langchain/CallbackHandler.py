@@ -1,18 +1,12 @@
 import typing
-from contextvars import Token
 
 import pydantic
-from opentelemetry import context, trace
 
 from langfuse._client.attributes import LangfuseOtelSpanAttributes
 from langfuse._client.get_client import get_client
 from langfuse._client.span import (
-    LangfuseAgent,
-    LangfuseChain,
     LangfuseGeneration,
-    LangfuseRetriever,
-    LangfuseSpan,
-    LangfuseTool,
+    LangfuseObservationWrapper,
 )
 from langfuse.logger import langfuse_logger
 
@@ -24,11 +18,23 @@ except ImportError as e:
         f"Could not import langchain. The langchain integration will not work. {e}"
     )
 
-from typing import Any, Dict, List, Literal, Optional, Sequence, Set, Type, Union, cast
+from typing import (
+    Any,
+    Dict,
+    List,
+    Literal,
+    Optional,
+    Sequence,
+    Set,
+    Type,
+    Union,
+    cast,
+)
 from uuid import UUID
 
 from langfuse._utils import _get_timestamp
 from langfuse.langchain.utils import _extract_model_name
+from langfuse.types import TraceContext
 
 try:
     from langchain.callbacks.base import (
@@ -77,22 +83,10 @@ class LangchainCallbackHandler(LangchainBaseCallbackHandler):
         """
         self.client = get_client(public_key=public_key)
 
-        self.runs: Dict[
-            UUID,
-            Union[
-                LangfuseSpan,
-                LangfuseGeneration,
-                LangfuseAgent,
-                LangfuseChain,
-                LangfuseTool,
-                LangfuseRetriever,
-            ],
-        ] = {}
-        self.context_tokens: Dict[UUID, Token] = {}
+        self.runs: Dict[UUID, LangfuseObservationWrapper] = {}
         self.prompt_to_parent_run_map: Dict[UUID, Any] = {}
         self.updated_completion_start_time_memo: Set[UUID] = set()
 
-        self.last_trace_id: Optional[str] = None
         self.update_trace = update_trace
 
     def on_llm_new_token(
@@ -272,9 +266,18 @@ class LangchainCallbackHandler(LangchainBaseCallbackHandler):
                 serialized, "chain", **kwargs
             )
 
+            trace_context: Optional[TraceContext] = None
+            if parent_run_id and parent_run_id in self.runs:
+                parent = cast(Any, self.runs[parent_run_id])
+                trace_context = {
+                    "trace_id": parent.trace_id,
+                    "parent_span_id": parent.id,
+                }
+
             span = self.client.start_observation(
+                trace_context=trace_context,
                 name=span_name,
-                as_type=observation_type,
+                as_type=cast(Any, observation_type),
                 metadata=span_metadata,
                 input=inputs,
                 level=cast(
@@ -300,8 +303,6 @@ class LangchainCallbackHandler(LangchainBaseCallbackHandler):
                     ),
                     **self._parse_langfuse_trace_attributes_from_metadata(metadata),
                 )
-
-            self.last_trace_id = self.runs[run_id].trace_id
 
         except Exception as e:
             langfuse_logger.exception(e)
@@ -337,51 +338,12 @@ class LangchainCallbackHandler(LangchainBaseCallbackHandler):
             del self.prompt_to_parent_run_map[run_id]
 
     def _attach_observation(
-        self,
-        run_id: UUID,
-        observation: Union[
-            LangfuseAgent,
-            LangfuseChain,
-            LangfuseGeneration,
-            LangfuseRetriever,
-            LangfuseSpan,
-            LangfuseTool,
-        ],
+        self, run_id: UUID, observation: LangfuseObservationWrapper
     ) -> None:
-        ctx = trace.set_span_in_context(observation._otel_span)
-        token = context.attach(ctx)
-
         self.runs[run_id] = observation
-        self.context_tokens[run_id] = token
 
-    def _detach_observation(
-        self, run_id: UUID
-    ) -> Optional[
-        Union[
-            LangfuseAgent,
-            LangfuseChain,
-            LangfuseGeneration,
-            LangfuseRetriever,
-            LangfuseSpan,
-            LangfuseTool,
-        ]
-    ]:
-        token = self.context_tokens.pop(run_id, None)
-
-        if token:
-            context.detach(token)
-
-        return cast(
-            Union[
-                LangfuseAgent,
-                LangfuseChain,
-                LangfuseGeneration,
-                LangfuseRetriever,
-                LangfuseSpan,
-                LangfuseTool,
-            ],
-            self.runs.pop(run_id, None),
-        )
+    def _detach_observation(self, run_id: UUID) -> Optional[LangfuseObservationWrapper]:
+        return cast(LangfuseObservationWrapper, self.runs.pop(run_id, None))
 
     def on_agent_action(
         self,
@@ -591,9 +553,18 @@ class LangchainCallbackHandler(LangchainBaseCallbackHandler):
                 serialized, "tool", **kwargs
             )
 
+            trace_context: Optional[TraceContext] = None
+            if parent_run_id and parent_run_id in self.runs:
+                parent = cast(Any, self.runs[parent_run_id])
+                trace_context = {
+                    "trace_id": parent.trace_id,
+                    "parent_span_id": parent.id,
+                }
+
             span = self.client.start_observation(
+                trace_context=trace_context,
                 name=self.get_langchain_run_name(serialized, **kwargs),
-                as_type=observation_type,
+                as_type=cast(Any, observation_type),
                 input=input_str,
                 metadata=meta,
                 level="DEBUG" if tags and LANGSMITH_TAG_HIDDEN in tags else None,
@@ -627,9 +598,18 @@ class LangchainCallbackHandler(LangchainBaseCallbackHandler):
                 serialized, "retriever", **kwargs
             )
 
+            trace_context: Optional[TraceContext] = None
+            if parent_run_id and parent_run_id in self.runs:
+                parent = cast(Any, self.runs[parent_run_id])
+                trace_context = {
+                    "trace_id": parent.trace_id,
+                    "parent_span_id": parent.id,
+                }
+
             span = self.client.start_observation(
+                trace_context=trace_context,
                 name=span_name,
-                as_type=observation_type,
+                as_type=cast(Any, observation_type),
                 metadata=span_metadata,
                 input=query,
                 level=cast(
@@ -753,10 +733,20 @@ class LangchainCallbackHandler(LangchainBaseCallbackHandler):
                 "prompt": registered_prompt,
             }
 
-            generation = self.client.start_observation(as_type="generation", **content)  # type: ignore
-            self._attach_observation(run_id, generation)
+            trace_context: Optional[TraceContext] = None
+            if parent_run_id and parent_run_id in self.runs:
+                parent = cast(Any, self.runs[parent_run_id])
+                trace_context = {
+                    "trace_id": parent.trace_id,
+                    "parent_span_id": parent.id,
+                }
 
-            self.last_trace_id = self.runs[run_id].trace_id
+            generation = self.client.start_observation(  # type: ignore
+                trace_context=trace_context,
+                as_type="generation",
+                **content,
+            )
+            self._attach_observation(run_id, generation)
 
         except Exception as e:
             langfuse_logger.exception(e)
